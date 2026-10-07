@@ -74,23 +74,3 @@ with at least one enrolled finger (`fprintd-enroll`).
 - The fingerprint prompt comes from the session's polkit authentication
   agent; without one, `pkcheck --allow-user-interaction` cannot prompt and
   verification fails closed (password unlock still works).
-
-## Remote builds on daemon
-
-The heavy compile (cargo release with LTO, webpack, forge packaging) can
-run on the `daemon` host over the tailnet instead of the workstation:
-
-```
-# one-time on daemon (x86_64 required): node 24 LTS (nodejs-lts-jod), rust
-rsync -a --exclude=src --exclude=pkg --exclude='*.tar.zst' ./ daemon:proton-pass-biometrics/
-ssh daemon 'cd proton-pass-biometrics && makepkg -sf'   # SOURCES via ~/.cache, no sudo if makedeps present
-scp daemon:proton-pass-biometrics/proton-pass-biometrics-*-x86_64.pkg.tar.zst .
-sudo pacman -U proton-pass-biometrics-*-x86_64.pkg.tar.zst
-```
-
-daemon's Tailscale key expiry must be disabled (`tailscale up --advertise-tags`
-or key expiry off in the admin console) for this to be reliable; it was
-offline with an expired node key when this repo was first built.
-
-The package produced on daemon is identical: PKGBUILD only consumes the
-upstream tag tarball plus the repo files, and `sha512sums` pins both.
