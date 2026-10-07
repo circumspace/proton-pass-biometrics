@@ -1,0 +1,75 @@
+diff -r a/applications/pass-desktop/src/app/App.tsx b/applications/pass-desktop/src/app/App.tsx
+--- a/applications/pass-desktop/src/app/App.tsx	2026-10-07 20:53:11.890497447 +0200
++++ b/applications/pass-desktop/src/app/App.tsx	2026-10-07 20:53:48.299556833 +0200
+@@ -95,7 +95,6 @@
+     generateOTP: (payload) => (payload.type === 'uri' ? generateTOTPCode(payload.totpUri) : null),
+ 
+     supportsBiometrics: async () => {
+-        if (BUILD_TARGET === 'linux') return false;
+         return window.ctxBridge?.canCheckPresence() ?? false;
+     },
+ 
+diff -r a/applications/pass-desktop/src/lib/biometrics/biometrics.linux.ts b/applications/pass-desktop/src/lib/biometrics/biometrics.linux.ts
+--- a/applications/pass-desktop/src/lib/biometrics/biometrics.linux.ts	1970-01-01 01:00:00.000000000 +0100
++++ b/applications/pass-desktop/src/lib/biometrics/biometrics.linux.ts	2026-10-07 20:53:38.173540399 +0200
+@@ -0,0 +1,35 @@
++import { uint8ArrayToBinaryString } from '@proton/shared/lib/helpers/encoding';
++
++import { biometric as linuxBiometrics } from 'proton-pass-desktop-native';
++
++import type { BiometricsFactory, BiometricsPlatformHandler } from './types';
++
++const factory: BiometricsFactory = (getWindow) => {
++    /** The native backend ignores the window handle on linux: the polkit
++     * authentication agent owns its own prompt window. Pass it through anyway. */
++    const checkPresence = async (reason = 'Proton Pass wants to unlock') => {
++        const handle = getWindow()?.getNativeWindowHandle();
++        await linuxBiometrics.checkPresence(handle ?? Buffer.alloc(0), reason);
++    };
++
++    const biometrics: BiometricsPlatformHandler = {
++        canCheckPresence: () => linuxBiometrics.canCheckPresence().catch(() => false),
++        checkPresence: (reason) => checkPresence(reason),
++        getSecret: async (key, _version) => {
++            await checkPresence();
++
++            const secretBytes = (await linuxBiometrics.getSecret(key)) as Uint8Array<ArrayBuffer>;
++            if (!secretBytes) return null;
++
++            /* Linux never shipped the version 1 legacy format: secrets are
++             * stored as raw byte arrays without any string conversion. */
++            return uint8ArrayToBinaryString(secretBytes);
++        },
++        setSecret: (key, secret) => linuxBiometrics.setSecret(key, secret),
++        deleteSecret: (key) => linuxBiometrics.deleteSecret(key),
++    };
++
++    return biometrics;
++};
++
++export default factory;
+\ No newline at end of file
+diff -r a/applications/pass-desktop/src/lib/biometrics/index.ts b/applications/pass-desktop/src/lib/biometrics/index.ts
+--- a/applications/pass-desktop/src/lib/biometrics/index.ts	2026-10-07 20:53:11.890497447 +0200
++++ b/applications/pass-desktop/src/lib/biometrics/index.ts	2026-10-07 20:53:48.300556834 +0200
+@@ -22,6 +22,8 @@
+                 return (require('./biometrics.windows').default as BiometricsFactory)(getWindow);
+             case 'darwin':
+                 return (require('./biometrics.macos').default as BiometricsFactory)(getWindow);
++            case 'linux':
++                return (require('./biometrics.linux').default as BiometricsFactory)(getWindow);
+             default:
+                 return {
+                     canCheckPresence: () => Promise.resolve(false),
+diff -r a/packages/pass/components/Settings/LockSetup.tsx b/packages/pass/components/Settings/LockSetup.tsx
+--- a/packages/pass/components/Settings/LockSetup.tsx	2026-10-07 20:53:11.891497448 +0200
++++ b/packages/pass/components/Settings/LockSetup.tsx	2026-10-07 20:53:48.301556836 +0200
+@@ -25,7 +25,7 @@
+      * or if lockMode is already biometrics (eg. when rolling back the flag)
+      */
+     const showBiometricsOption =
+-        password.enabled && BUILD_TARGET !== 'linux' && (DESKTOP_BUILD || lock.mode === LockMode.BIOMETRICS);
++        password.enabled && (DESKTOP_BUILD || lock.mode === LockMode.BIOMETRICS);
+ 
+     const showDesktopOption = extensionBiometrics.enabled || lock.mode === LockMode.DESKTOP;
+ 

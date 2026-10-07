@@ -1,0 +1,241 @@
+diff -r a/applications/pass-desktop/native/shared/Cargo.toml b/applications/pass-desktop/native/shared/Cargo.toml
+--- a/applications/pass-desktop/native/shared/Cargo.toml	2026-10-07 20:53:11.888497443 +0200
++++ b/applications/pass-desktop/native/shared/Cargo.toml	2026-10-07 20:53:48.302556838 +0200
+@@ -33,3 +33,7 @@
+ security-framework-sys = "=2.9.1"
+ objc2-local-authentication = { version = "0.3", features = ["block2"] }
+ robius-authentication = "0.3"
++
++[target.'cfg(target_os = "linux")'.dependencies]
++whoami = "1"
++zbus = { version = "5", features = ["blocking-api"] }
+diff -r a/applications/pass-desktop/native/shared/src/biometrics/linux.rs b/applications/pass-desktop/native/shared/src/biometrics/linux.rs
+--- a/applications/pass-desktop/native/shared/src/biometrics/linux.rs	2026-10-07 20:53:11.889497445 +0200
++++ b/applications/pass-desktop/native/shared/src/biometrics/linux.rs	2026-10-07 21:47:12.049621587 +0200
+@@ -1,29 +1,215 @@
+-use anyhow::{bail, Result};
++use std::collections::HashMap;
++use std::process::Command;
++
++use anyhow::{anyhow, bail, Context, Result};
++use zbus::blocking::{Connection, Proxy};
++use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
++
++const FPRINT_BUS: &str = "net.reactivated.Fprint";
++const FPRINT_MANAGER_PATH: &str = "/net/reactivated/Fprint/Manager";
++const FPRINT_MANAGER_IFACE: &str = "net.reactivated.Fprint.Manager";
++const FPRINT_DEVICE_IFACE: &str = "net.reactivated.Fprint.Device";
++
++const SECRETS_BUS: &str = "org.freedesktop.secrets";
++const SECRETS_SERVICE_PATH: &str = "/org/freedesktop/secrets";
++const SECRETS_SERVICE_IFACE: &str = "org.freedesktop.Secret.Service";
++const SECRETS_COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
++const SECRETS_ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
++const SECRETS_PROMPT_IFACE: &str = "org.freedesktop.Secret.Prompt";
++const SECRETS_DEFAULT_COLLECTION_PATH: &str = "/org/freedesktop/secrets/aliases/default";
+ 
++const POLKIT_ACTION: &str = "ch.proton.pass.unlock";
++const SECRET_LABEL: &str = "Proton Pass";
++const SECRET_ATTR: &str = "key";
++
+ pub struct Biometrics {}
+ 
+ impl super::BiometricsTrait for Biometrics {
+     fn can_check_presence() -> Result<bool> {
+-        bail!("Not implemented")
++        run(can_check_presence_blocking)
+     }
+ 
+     fn check_presence(_handle: Vec<u8>, _reason: String) -> Result<()> {
+-        bail!("Not implemented")
++        run(|| check_presence_blocking())
+     }
+ 
+     fn new_check_presence(_reason: String) -> Result<()> {
+-        bail!("Not implemented")
++        run(move || check_presence_blocking())
++    }
++
++    fn get_secret(key: String) -> Result<Vec<u8>> {
++        run(move || get_secret_blocking(key))
++    }
++
++
++    fn set_secret(key: String, data: Vec<u8>) -> Result<()> {
++        run(move || set_secret_blocking(key, data))
++    }
++
++    fn delete_secret(key: String) -> Result<()> {
++        run(move || delete_secret_blocking(key))
++    }
++}
++
++// The napi layer exposes these trait methods as async functions, so they run
++// on its tokio runtime. zbus' blocking API drives its own executor and panics
++// when nested inside one, so every call runs on a plain OS thread.
++fn run<T, F>(f: F) -> Result<T>
++where
++    T: Send + 'static,
++    F: FnOnce() -> Result<T> + Send + 'static,
++{
++    std::thread::scope(|scope| {
++        scope
++            .spawn(f)
++            .join()
++            .map_err(|_| anyhow!("biometrics worker thread panicked"))?
++    })
++}
++
++fn can_check_presence_blocking() -> Result<bool> {
++    // The lock settings only offer the biometrics option while this
++    // returns true, so any failure here is reported as "unavailable"
++    // rather than surfaced as an error.
++    let probe = || -> Result<bool> {
++        if !pkcheck_available() {
++            return Ok(false);
++        }
++
++        let user = whoami::username();
++        let conn = Connection::system()?;
++        let manager = Proxy::new(&conn, FPRINT_BUS, FPRINT_MANAGER_PATH, FPRINT_MANAGER_IFACE)?;
++        let devices: Vec<OwnedObjectPath> = manager.call("GetDevices", &())?;
++
++        Ok(devices.iter().any(|device| {
++            let Ok(device) = Proxy::new(&conn, FPRINT_BUS, device.as_str(), FPRINT_DEVICE_IFACE) else {
++                return false;
++            };
++            let fingers: Vec<String> = device.call("ListEnrolledFingers", &user).unwrap_or_default();
++            !fingers.is_empty()
++        }))
++    };
++
++    Ok(probe().unwrap_or_else(|err| {
++        log::warn!("[biometrics] presence check failed: {err}");
++        false
++    }))
++}
++
++fn check_presence_blocking() -> Result<()> {
++    // The auth_self polkit action routes through PAM: fprintd offers the
++    // fingerprint prompt first, with the password as fallback.
++    let subject = std::process::id().to_string();
++    let output = Command::new("pkcheck")
++        .arg("--allow-user-interaction")
++        .arg("--action-id")
++        .arg(POLKIT_ACTION)
++        .arg("--process")
++        .arg(subject)
++        .output()
++        .context("failed to execute pkcheck")?;
++
++    if output.status.success() {
++        return Ok(());
+     }
+ 
+-    fn get_secret(_key: String) -> Result<Vec<u8>> {
+-        bail!("Not implemented")
++    log::warn!(
++        "[biometrics] pkcheck exited {}: {}",
++        output.status,
++        String::from_utf8_lossy(&output.stderr)
++    );
++    bail!("Fingerprint authentication failed or was cancelled")
++}
++
++fn get_secret_blocking(key: String) -> Result<Vec<u8>> {
++    let conn = Connection::session()?;
++    let session = open_secret_session(&conn)?;
++    let items = search_secret_items(&conn, &key)?;
++
++    let Some(item_path) = items.first() else {
++        bail!("No stored secret");
++    };
++
++    let item = Proxy::new(&conn, SECRETS_BUS, item_path.as_str(), SECRETS_ITEM_IFACE)?;
++    let (_session, _params, value, _content_type): (OwnedObjectPath, Vec<u8>, Vec<u8>, String) =
++        item.call("GetSecret", &session)?;
++
++    Ok(value)
++}
++
++fn set_secret_blocking(key: String, data: Vec<u8>) -> Result<()> {
++    let conn = Connection::session()?;
++    let session = open_secret_session(&conn)?;
++    let collection =
++        Proxy::new(&conn, SECRETS_BUS, SECRETS_DEFAULT_COLLECTION_PATH, SECRETS_COLLECTION_IFACE)?;
++
++    let mut properties: HashMap<&str, Value> = HashMap::new();
++    properties.insert("org.freedesktop.Secret.Item.Label", Value::from(SECRET_LABEL));
++    properties.insert("org.freedesktop.Secret.Item.Attributes", Value::from(secret_attributes(&key)));
++
++    let secret = (session, Vec::<u8>::new(), data, "application/octet-stream");
++    let (item, prompt): (OwnedObjectPath, OwnedObjectPath) =
++        collection.call("CreateItem", &(properties, secret, true))?;
++
++    if item.as_str() != "/" {
++        return Ok(());
+     }
+ 
+-    fn set_secret(_key: String, _data: Vec<u8>) -> Result<()> {
+-        bail!("Not implemented")
++    run_prompt(&conn, prompt)?;
++
++    Ok(())
++}
++
++fn delete_secret_blocking(key: String) -> Result<()> {
++    let conn = Connection::session()?;
++    let items = search_secret_items(&conn, &key)?;
++
++    for item_path in items {
++        let item = Proxy::new(&conn, SECRETS_BUS, item_path.as_str(), SECRETS_ITEM_IFACE)?;
++        let prompt: OwnedObjectPath = item.call("Delete", &())?;
++        if prompt.as_str() != "/" {
++            run_prompt(&conn, prompt)?;
++        }
+     }
+ 
+-    fn delete_secret(_key: String) -> Result<()> {
+-        bail!("Not implemented")
++    Ok(())
++}
++
++fn run_prompt(conn: &Connection, prompt: OwnedObjectPath) -> Result<()> {
++    let prompt_proxy = Proxy::new(conn, SECRETS_BUS, prompt.as_str(), SECRETS_PROMPT_IFACE)?;
++    let mut completed = prompt_proxy.receive_signal("Completed")?;
++    let _: () = prompt_proxy.call("Prompt", &"")?;
++
++    let message = completed.next().ok_or_else(|| anyhow!("prompt closed without completing"))?;
++    let (dismissed, _result): (bool, OwnedValue) = message.body().deserialize()?;
++
++    if dismissed {
++        bail!("Keyring unlock prompt was cancelled");
+     }
++
++    Ok(())
+ }
++
++fn secret_attributes(key: &str) -> HashMap<&str, &str> {
++    HashMap::from([(SECRET_ATTR, key)])
++}
++
++fn open_secret_session(conn: &Connection) -> Result<OwnedObjectPath> {
++    let service = Proxy::new(conn, SECRETS_BUS, SECRETS_SERVICE_PATH, SECRETS_SERVICE_IFACE)?;
++    let (_output, session): (OwnedValue, OwnedObjectPath) =
++        service.call("OpenSession", &("plain", Value::from("")))?;
++    Ok(session)
++}
++
++fn search_secret_items(conn: &Connection, key: &str) -> Result<Vec<OwnedObjectPath>> {
++    let service = Proxy::new(conn, SECRETS_BUS, SECRETS_SERVICE_PATH, SECRETS_SERVICE_IFACE)?;
++    let (unlocked, _locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
++        service.call("SearchItems", &secret_attributes(key))?;
++    Ok(unlocked)
++}
++
++fn pkcheck_available() -> bool {
++    std::env::var_os("PATH")
++        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("pkcheck").is_file()))
++        .unwrap_or(false)
++}
+\ No newline at end of file
