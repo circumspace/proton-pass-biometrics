@@ -1,3 +1,9 @@
+# proton-pass-biometrics — moved
+
+This package now lives in
+[circumspace/pkgbuilds](https://github.com/circumspace/pkgbuilds/tree/master/proton-pass-biometrics),
+history included. This repository is archived.
+
 # proton-pass-biometrics
 
 Source-built Arch package of [Proton Pass](https://proton.me/pass) desktop
